@@ -1,0 +1,114 @@
+__include__: [
+  '../dataset/aitod_detection.yml',
+  '../runtime.yml',
+  '../base/dataloader.yml',
+  '../base/optimizer.yml',
+  '../base/deimv2.yml',
+]
+
+output_dir: ./outputs/DEIMv2_dinov3_s_aitodv3
+eval_spatial_size: [800, 800] # Override the default 640x640 from base configs
+
+DEIM:
+  backbone: DINOv3STAs
+
+DINOv3STAs:
+  name: vit_tiny
+  embed_dim: 192
+  weights_path: ./ckpts/vitt_distill.pt
+  interaction_indexes: [3, 7, 11]   # only need the [1/8, 1/16, 1/32]
+  num_heads: 3
+
+HybridEncoder:
+  in_channels: [192, 192, 192]
+  depth_mult: 0.67
+  expansion: 0.34
+  hidden_dim: 192
+  dim_feedforward: 512
+
+DEIMTransformer:
+  feat_channels: [192, 192, 192]
+  hidden_dim: 192
+  dim_feedforward: 512
+  num_layers: 4  # 4 5 6
+  eval_idx: -1  # -2 -3 -4
+  num_queries: 900 # AI-TOD中的极小目标极其密集，300个Query远远不够，甚至会卡死上限
+
+PostProcessor:
+  num_top_queries: 900 # 对应输出900个检测框
+
+
+## Optimizer
+optimizer:
+  type: AdamW
+
+  params: 
+    -
+      # except norm/bn/bias in self.dinov3
+      params: '^(?=.*.dinov3)(?!.*(?:norm|bn|bias)).*$'  
+      lr: 0.000025
+    -
+      # including all norm/bn/bias in self.dinov3
+      params: '^(?=.*.dinov3)(?=.*(?:norm|bn|bias)).*$'    
+      lr: 0.000025
+      weight_decay: 0.
+    - 
+      # including all norm/bn/bias except for the self.dinov3
+      params: '^(?=.*(?:sta|encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.
+
+  lr: 0.0005
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+# Increase to search for the optimal ema
+epoches: 140 # 调高至140轮
+
+## Our LR-Scheduler
+flat_epoch: 74    # 4 + epoch // 2 = 4 + 70 = 74
+no_aug_epoch: 12
+
+## Our DataAug
+train_dataloader:
+  dataset: 
+    transforms:
+      ops:
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [800, 800], }
+        - {type: SanitizeBoundingBoxes, min_size: 2}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        epoch: 140   # 不再需要中途切换policy
+
+  collate_fn:
+    base_size: 800
+    mixup_prob: 0.0      # 关闭 Mixup! 对微小目标极其不利
+    ema_restart_decay: 0.9999
+    base_size_repeat: 20
+    mixup_epochs: [0, 0] # 关闭 Mixup
+    stop_epoch: 140
+    copyblend_epochs: [0, 0] # 关闭 copyblend
+
+  total_batch_size: 4 # 进一步减小batch_size以解决OOM，每卡分到2
+
+val_dataloader:
+  dataset:
+    transforms:
+      ops:
+        - {type: Resize, size: [800, 800], }
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+
+DEIMCriterion:
+  weight_dict: {loss_mal: 1, loss_bbox: 8, loss_giou: 1, loss_fgl: 0.15, loss_ddf: 1.5}
+  matcher:
+    type: HungarianMatcher
+    weight_dict: {cost_class: 2, cost_bbox: 8, cost_giou: 1} # 极小目标对L1距离非常敏感，对GIoU极其脆弱，调整比重
+    alpha: 0.25
+    gamma: 2.0
+    change_matcher: True
+    iou_order_alpha: 4.0
+    matcher_change_epoch: 110
